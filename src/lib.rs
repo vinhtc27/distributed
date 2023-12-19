@@ -127,7 +127,7 @@ where
             let line = line.context("Maelstrom input from STDIN could not be read")?;
             let input: Message<P> = serde_json::from_str(&line)
                 .context("Maelstrom input from STDIN could not be deserialized")?;
-            if let Err(_) = tx.send(Event::Message(input)) {
+            if tx.send(Event::Message(input)).is_err() {
                 return Ok::<_, anyhow::Error>(());
             }
         }
