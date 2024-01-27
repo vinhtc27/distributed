@@ -31,7 +31,6 @@ Session.vim
 
 ## Configuration
 /config.toml
-/Makefile
 config.mk
 config.stamp
 no_llvm_build

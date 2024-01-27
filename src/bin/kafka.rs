@@ -2,7 +2,7 @@ use distributed::*;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::{borrow::BorrowMut, collections::HashMap, io::StdoutLock, time::Duration};
+use std::{borrow::BorrowMut, collections::HashMap, io::StdoutLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -31,11 +31,18 @@ enum Payload {
     ListCommittedOffsetsOk {
         offsets: HashMap<String, usize>,
     },
-    Gossip,
+    GossipSend {
+        key: String,
+        msg: usize,
+    },
+    GossipCommit {
+        offsets: HashMap<String, usize>,
+    },
 }
 
 enum InjectedPayload {
-    Gossip,
+    GossipSend { key: String, msg: usize },
+    GossipCommit { offsets: HashMap<String, usize> },
 }
 
 #[allow(dead_code)]
@@ -46,6 +53,7 @@ struct KafkaNode {
     counter: HashMap<String, usize>,
     commited_offsets: HashMap<String, usize>,
     others: Vec<String>,
+    tx: std::sync::mpsc::Sender<Event<Payload, InjectedPayload>>,
 }
 
 impl Node<(), Payload, InjectedPayload> for KafkaNode {
@@ -54,16 +62,6 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         init: Init,
         tx: std::sync::mpsc::Sender<Event<Payload, InjectedPayload>>,
     ) -> anyhow::Result<Self> {
-        std::thread::spawn(move || {
-            // generate gossip events
-            // TODO: handle EOF signal
-            loop {
-                std::thread::sleep(Duration::from_millis(300));
-                if tx.send(Event::Injected(InjectedPayload::Gossip)).is_err() {
-                    break;
-                }
-            }
-        });
         Ok(Self {
             node: init.node_id.clone(),
             id: 1,
@@ -75,6 +73,7 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
                 .into_iter()
                 .filter(|n| n != &init.node_id)
                 .collect(),
+            tx,
         })
     }
 
@@ -86,12 +85,57 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         match input {
             Event::EOF => {}
             Event::Injected(payload) => match payload {
-                InjectedPayload::Gossip => {}
+                InjectedPayload::GossipSend { key, msg } => {
+                    for n in &self.others {
+                        Message {
+                            src: self.node.clone(),
+                            dst: n.clone(),
+                            body: Body {
+                                id: None,
+                                in_reply_to: None,
+                                payload: Payload::GossipSend {
+                                    key: key.clone(),
+                                    msg,
+                                },
+                            },
+                        }
+                        .send(&mut *output)
+                        .with_context(|| format!("gossip to {}", n))?;
+                    }
+                }
+                InjectedPayload::GossipCommit { offsets } => {
+                    for n in &self.others {
+                        Message {
+                            src: self.node.clone(),
+                            dst: n.clone(),
+                            body: Body {
+                                id: None,
+                                in_reply_to: None,
+                                payload: Payload::GossipCommit {
+                                    offsets: offsets.clone(),
+                                },
+                            },
+                        }
+                        .send(&mut *output)
+                        .with_context(|| format!("gossip to {}", n))?;
+                    }
+                }
             },
             Event::Message(input) => {
                 let mut reply = input.into_reply(Some(&mut self.id));
                 match reply.body.payload {
-                    Payload::Gossip => {}
+                    Payload::GossipSend { key, msg } => {
+                        self.messages
+                            .entry(key.clone())
+                            .or_insert_with(Vec::new)
+                            .push(msg);
+                        *self.counter.entry(key.clone()).or_insert(0).borrow_mut() += 1;
+                    }
+                    Payload::GossipCommit { offsets } => {
+                        for (key, offset) in offsets {
+                            *self.commited_offsets.entry(key).or_insert(0).borrow_mut() = offset;
+                        }
+                    }
                     Payload::Send { key, msg } => {
                         self.messages
                             .entry(key.clone())
@@ -103,6 +147,8 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
                         };
                         reply.send(&mut *output).context("reply to send")?;
                         *self.counter.get_mut(&key).unwrap() += 1;
+                        self.tx
+                            .send(Event::Injected(InjectedPayload::GossipSend { key, msg }))?;
                     }
                     Payload::Poll { offsets } => {
                         let msgs: HashMap<String, Vec<(usize, usize)>> = offsets
@@ -124,13 +170,15 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
                         reply.send(&mut *output).context("reply to poll")?;
                     }
                     Payload::CommitOffsets { offsets } => {
-                        for (key, offset) in offsets {
+                        for (key, offset) in offsets.clone() {
                             *self.commited_offsets.entry(key).or_insert(0).borrow_mut() = offset;
                         }
                         reply.body.payload = Payload::CommitOffsetsOk;
                         reply
                             .send(&mut *output)
                             .context("reply to commit_offsets")?;
+                        self.tx
+                            .send(Event::Injected(InjectedPayload::GossipCommit { offsets }))?;
                     }
                     Payload::ListCommittedOffsets { keys } => {
                         reply.body.payload = Payload::ListCommittedOffsetsOk {
