@@ -2,7 +2,7 @@ use distributed::*;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::{borrow::BorrowMut, collections::HashMap, io::StdoutLock};
+use std::{collections::HashMap, io::StdoutLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -42,18 +42,95 @@ enum Payload {
 
 enum InjectedPayload {
     GossipSend { key: String, msg: usize },
-    GossipCommit { offsets: HashMap<String, usize> },
+    GossipCommitOffsets { offsets: HashMap<String, usize> },
 }
 
 #[allow(dead_code)]
 struct KafkaNode {
     node: String,
     id: usize,
-    messages: HashMap<String, Vec<usize>>,
-    counter: HashMap<String, usize>,
-    commited_offsets: HashMap<String, usize>,
+    messages: Messages,
     others: Vec<String>,
     tx: std::sync::mpsc::Sender<Event<Payload, InjectedPayload>>,
+}
+
+// CommitedOffsetAndMessage
+struct COAM {
+    commited_offset: Option<usize>,
+    msgs: Vec<usize>,
+}
+
+impl COAM {
+    fn new() -> Self {
+        Self {
+            commited_offset: None,
+            msgs: Vec::new(),
+        }
+    }
+}
+
+struct Messages {
+    map: HashMap<String, COAM>,
+}
+
+impl Messages {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    fn add_msg(&mut self, key: String, msg: usize) -> usize {
+        self.map
+            .entry(key.clone())
+            .or_insert_with(|| COAM::new())
+            .msgs
+            .push(msg);
+
+        match self.map.get(&key) {
+            Some(coam) => coam.msgs.len() - 1,
+            None => 0,
+        }
+    }
+
+    fn get_msgs(&self, offsets: &HashMap<String, usize>) -> HashMap<String, Vec<(usize, usize)>> {
+        offsets
+            .iter()
+            .filter_map(|(key, offset)| {
+                self.map.get(key).map(|coam| {
+                    (
+                        key.clone(),
+                        coam.msgs[*offset..]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, m)| (offset + i, m.clone()))
+                            .collect(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn insert_commited_offsets(&mut self, offsets: HashMap<String, usize>) {
+        for (key, offset) in offsets {
+            match self.map.get_mut(&key) {
+                Some(coam) => coam.commited_offset = Some(offset),
+                None => unreachable!(),
+            }
+        }
+    }
+
+    fn get_commited_offsets(&self, keys: &Vec<String>) -> HashMap<String, usize> {
+        keys.iter()
+            .filter_map(|key| {
+                let commited_offset = self.map.get(key).map(|coam| coam.commited_offset);
+                match commited_offset {
+                    Some(Some(offset)) => Some((key.clone(), offset)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
 }
 
 impl Node<(), Payload, InjectedPayload> for KafkaNode {
@@ -65,9 +142,7 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
         Ok(Self {
             node: init.node_id.clone(),
             id: 1,
-            messages: HashMap::new(),
-            counter: HashMap::new(),
-            commited_offsets: HashMap::new(),
+            messages: Messages::new(),
             others: init
                 .node_ids
                 .into_iter()
@@ -103,7 +178,7 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
                         .with_context(|| format!("gossip to {}", n))?;
                     }
                 }
-                InjectedPayload::GossipCommit { offsets } => {
+                InjectedPayload::GossipCommitOffsets { offsets } => {
                     for n in &self.others {
                         Message {
                             src: self.node.clone(),
@@ -125,70 +200,43 @@ impl Node<(), Payload, InjectedPayload> for KafkaNode {
                 let mut reply = input.into_reply(Some(&mut self.id));
                 match reply.body.payload {
                     Payload::GossipSend { key, msg } => {
-                        self.messages
-                            .entry(key.clone())
-                            .or_insert_with(Vec::new)
-                            .push(msg);
-                        *self.counter.entry(key.clone()).or_insert(0).borrow_mut() += 1;
+                        self.messages.add_msg(key, msg);
                     }
                     Payload::GossipCommit { offsets } => {
-                        for (key, offset) in offsets {
-                            *self.commited_offsets.entry(key).or_insert(0).borrow_mut() = offset;
-                        }
+                        self.messages.insert_commited_offsets(offsets);
                     }
                     Payload::Send { key, msg } => {
-                        self.messages
-                            .entry(key.clone())
-                            .or_insert_with(Vec::new)
-                            .push(msg);
-                        self.counter.entry(key.clone()).or_insert(0);
-                        reply.body.payload = Payload::SendOk {
-                            offset: *self.counter.get(&key).unwrap(),
-                        };
+                        let offset = self.messages.add_msg(key.clone(), msg);
+
+                        reply.body.payload = Payload::SendOk { offset };
                         reply.send(&mut *output).context("reply to send")?;
-                        *self.counter.get_mut(&key).unwrap() += 1;
+
                         self.tx
                             .send(Event::Injected(InjectedPayload::GossipSend { key, msg }))?;
                     }
                     Payload::Poll { offsets } => {
-                        let msgs: HashMap<String, Vec<(usize, usize)>> = offsets
-                            .iter()
-                            .filter_map(|(key, offset)| {
-                                self.messages.get(key).map(|key_msgs| {
-                                    (
-                                        key.clone(),
-                                        key_msgs[*offset..]
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, m)| (offset + i, m.clone()))
-                                            .collect(),
-                                    )
-                                })
-                            })
-                            .collect();
-                        reply.body.payload = Payload::PollOk { msgs };
+                        reply.body.payload = Payload::PollOk {
+                            msgs: self.messages.get_msgs(&offsets),
+                        };
                         reply.send(&mut *output).context("reply to poll")?;
                     }
                     Payload::CommitOffsets { offsets } => {
-                        for (key, offset) in offsets.clone() {
-                            *self.commited_offsets.entry(key).or_insert(0).borrow_mut() = offset;
-                        }
+                        self.messages.insert_commited_offsets(offsets.clone());
+
                         reply.body.payload = Payload::CommitOffsetsOk;
                         reply
                             .send(&mut *output)
                             .context("reply to commit_offsets")?;
+
                         self.tx
-                            .send(Event::Injected(InjectedPayload::GossipCommit { offsets }))?;
+                            .send(Event::Injected(InjectedPayload::GossipCommitOffsets {
+                                offsets,
+                            }))?;
                     }
                     Payload::ListCommittedOffsets { keys } => {
-                        reply.body.payload = Payload::ListCommittedOffsetsOk {
-                            offsets: keys
-                                .iter()
-                                .map(|key| {
-                                    (key.clone(), *self.commited_offsets.get(key).unwrap_or(&0))
-                                })
-                                .collect(),
-                        };
+                        let offsets = self.messages.get_commited_offsets(&keys);
+
+                        reply.body.payload = Payload::ListCommittedOffsetsOk { offsets };
                         reply
                             .send(&mut *output)
                             .context("reply to list_committed_offsets")?;

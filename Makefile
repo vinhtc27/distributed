@@ -33,3 +33,6 @@ single-node-kafka:
 
 multi-node-kafka:
 	make build && cd maelstrom && ./maelstrom test -w kafka --bin ../target/release/kafka --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
+
+efficient-kafka:
+	make build && cd maelstrom && ./maelstrom test -w kafka --bin ../target/release/kafka --node-count 2 --concurrency 2n --time-limit 20 --rate 1000
